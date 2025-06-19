@@ -1,0 +1,10 @@
+{
+  "profiles": {
+    "SafetyCultureMondayComIntegration": {
+      "commandName": "Project"
+    },
+    "Container (Dockerfile)": {
+      "commandName": "Docker"
+    }
+  }
+}
