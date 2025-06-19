@@ -1,21 +1,27 @@
 ﻿using System;
 using System.IO;
-using System.Net;
 using System.Net.Http;
 using System.Net.Http.Headers;
 using System.Text.Json;
 using System.Collections.Generic;
 using System.Threading.Tasks;
 
+// Configuration classes
+public class AppConfig
+{
+    public SafetyCultureConfig SafetyCulture { get; set; } = new SafetyCultureConfig();
+}
+
+public class SafetyCultureConfig
+{
+    public string ApiToken { get; set; } = string.Empty;
+    public string TemplateId { get; set; } = string.Empty;
+    public string BaseUrl { get; set; } = "https://api.safetyculture.io";
+}
+
 class Program
 {
-    // ── CONFIG ─────────────────────────────────────────────────────────────
-    private const string EnvTokenVar = "SAFETYCULTURE_API_TOKEN";
-    private const string FallbackToken = "9fe734dc1d6ceb4402ac97cf0a053f5c04966f9fe11b4068725bed0a4b09d851";
-    private const string TemplateId = "template_93bca68053f4450e82f78071d176b5c1";
-    private const string BaseUrl = "https://api.safetyculture.io";
-
-    // Custom labels to extract
+    // Custom fields to extract
     static readonly HashSet<string> DesiredLabels = new(StringComparer.OrdinalIgnoreCase)
     {
         "Part-Number", "Transaction Type", "Quantity"
@@ -23,107 +29,99 @@ class Program
 
     static async Task Main()
     {
-        // 0) Load API token
-        var apiToken = Environment.GetEnvironmentVariable(EnvTokenVar);
-        if (string.IsNullOrWhiteSpace(apiToken))
+        // 1) Load configuration from JSON or environment
+        AppConfig config;
+        if (File.Exists("appsettings.json"))
         {
-            Console.WriteLine($"WARNING: Env var '{EnvTokenVar}' not found; using fallback token.");
-            apiToken = FallbackToken;
+            var json = await File.ReadAllTextAsync("appsettings.json");
+            config = JsonSerializer.Deserialize<AppConfig>(json, new JsonSerializerOptions
+            {
+                PropertyNameCaseInsensitive = true
+            }) ?? throw new Exception("Failed to parse appsettings.json");
+        }
+        else
+        {
+            // Fallback to environment variables
+            config = new AppConfig
+            {
+                SafetyCulture = new SafetyCultureConfig
+                {
+                    ApiToken = Environment.GetEnvironmentVariable("SAFETYCULTURE_API_TOKEN") ?? throw new Exception("Env var SAFETYCULTURE_API_TOKEN required"),
+                    TemplateId = Environment.GetEnvironmentVariable("SAFETYCULTURE_TEMPLATE_ID") ?? throw new Exception("Env var SAFETYCULTURE_TEMPLATE_ID required"),
+                    BaseUrl = Environment.GetEnvironmentVariable("SAFETYCULTURE_BASE_URL") ?? "https://api.safetyculture.io"
+                }
+            };
         }
 
-        using var client = new HttpClient { BaseAddress = new Uri(BaseUrl) };
-        client.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", apiToken);
+        var sc = config.SafetyCulture;
+        using var client = new HttpClient { BaseAddress = new Uri(sc.BaseUrl) };
+        client.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", sc.ApiToken);
 
-        // Compute start of today (UTC) for update filter
+        // 2) Compute start of today (UTC)
         DateTimeOffset todayStart = DateTimeOffset.UtcNow.Date;
-        Console.WriteLine($"Filtering inspections updated since: {todayStart:O}\n");
+        Console.WriteLine($"Inspections updated since {todayStart:yyyy-MM-dd} (UTC):\n");
 
-        // 1) Fetch all audits for the template
-        string searchUrl = $"/audits/search?template={TemplateId}";
-        Console.WriteLine($"[DEBUG] GET {searchUrl}");
-        var resp = await client.GetAsync(searchUrl);
-        Console.WriteLine($"[DEBUG] Response: {(int)resp.StatusCode} {resp.ReasonPhrase}");
-        if (resp.StatusCode == HttpStatusCode.Unauthorized)
-        {
-            Console.Error.WriteLine("ERROR: Unauthorized (401). Check your API token.");
-            return;
-        }
-        resp.EnsureSuccessStatusCode();
-
-        using var listDoc = JsonDocument.Parse(await resp.Content.ReadAsStringAsync());
+        // 3) Fetch summary list with modified_at
+        string listUrl = $"/audits/search?template={sc.TemplateId}&field=audit_id&field=modified_at";
+        var listResp = await client.GetAsync(listUrl);
+        listResp.EnsureSuccessStatusCode();
+        using var listDoc = JsonDocument.Parse(await listResp.Content.ReadAsStringAsync());
         var audits = listDoc.RootElement.GetProperty("audits");
 
         bool any = false;
-        // 2) Process each audit and filter by modified_at
+
+        // 4) Iterate summary and filter by modified_at >= todayStart
         foreach (var a in audits.EnumerateArray())
         {
-            if (!a.TryGetProperty("audit_id", out var aid))
+            if (!a.TryGetProperty("audit_id", out var idElem) || !a.TryGetProperty("modified_at", out var modElem))
                 continue;
-            string auditId = aid.GetString()!;
-
-            // Fetch full details
-            var detailResp = await client.GetAsync($"/audits/{auditId}");
-            if (!detailResp.IsSuccessStatusCode)
-                continue;
-
-            using var detDoc = JsonDocument.Parse(await detailResp.Content.ReadAsStringAsync());
-            var root = detDoc.RootElement;
-
-            // Check modified_at
-            if (!root.TryGetProperty("modified_at", out var modProp) ||
-                !DateTimeOffset.TryParse(modProp.GetString(), out var modifiedAt) ||
-                modifiedAt < todayStart)
+            if (!DateTimeOffset.TryParse(modElem.GetString(), out var modifiedAt) || modifiedAt < todayStart)
                 continue;
 
             any = true;
-            Console.WriteLine($"\nInspection ID: {auditId}");
-            Console.WriteLine($"  Created:   {root.GetProperty("created_at").GetString()}");
+            string auditId = idElem.GetString()!;
+            Console.WriteLine($"--- Audit ID: {auditId} (modified: {modifiedAt:O}) ---");
 
-            // Print header details
-            if (root.TryGetProperty("template_name", out var tplName))
-                Console.WriteLine($"  Template: {tplName.GetString()}");
+            // 5) Fetch full details
+            var detResp = await client.GetAsync($"/audits/{auditId}");
+            detResp.EnsureSuccessStatusCode();
+            using var detDoc = JsonDocument.Parse(await detResp.Content.ReadAsStringAsync());
+            var root = detDoc.RootElement;
+
+            // Print core metadata
+            if (root.TryGetProperty("created_at", out var crt))
+                Console.WriteLine($"Created:  {crt.GetString()}");
             if (root.TryGetProperty("audit_data", out var ad))
             {
                 if (ad.TryGetProperty("completion_status", out var st))
-                    Console.WriteLine($"  Status:   {st.GetString()}");
-                if (ad.TryGetProperty("score", out var sc))
-                    Console.WriteLine($"  Score:    {sc.GetDouble()}%");
+                    Console.WriteLine($"Status:   {st.GetString()}");
+                if (ad.TryGetProperty("score_percentage", out var pc))
+                    Console.WriteLine($"Score:    {pc.GetDouble()}%");
             }
 
-            // Updated timestamp
-            Console.WriteLine($"  Updated:   {modProp.GetString()}");
-
-            // Additional info
-            if (root.TryGetProperty("location", out var loc) && !string.IsNullOrWhiteSpace(loc.GetString()))
-                Console.WriteLine($"  Location: {loc.GetString()}");
-            if (root.TryGetProperty("owner", out var owner))
-                Console.WriteLine($"  Owner:    {owner.GetString()}");
-            if (root.TryGetProperty("last_edited_by", out var editor))
-                Console.WriteLine($"  Edited by: {editor.GetString()}");
-
-            // Custom fields
-            Console.WriteLine("  Custom fields:");
+            // Extract custom fields
+            Console.WriteLine("Custom fields:");
             bool found = false;
             ExtractCustomFields(root, (lbl, val) =>
             {
                 found = true;
-                Console.WriteLine($"    {lbl}: {val}");
+                Console.WriteLine($"  {lbl}: {val}");
             });
             if (!found)
-                Console.WriteLine("    (none found)");
+                Console.WriteLine("  (none found)");
+
+            Console.WriteLine();
         }
 
         if (!any)
-            Console.WriteLine($"No inspections updated since {todayStart:yyyy-MM-dd}.");
+            Console.WriteLine("No inspections updated today.");
     }
 
-    // Recursively find custom field labels
     static void ExtractCustomFields(JsonElement el, Action<string, string> onMatch)
     {
         if (el.ValueKind == JsonValueKind.Object)
         {
-            if (el.TryGetProperty("label", out var lbl) &&
-                DesiredLabels.Contains(lbl.GetString() ?? string.Empty))
+            if (el.TryGetProperty("label", out var lbl) && DesiredLabels.Contains(lbl.GetString() ?? string.Empty))
             {
                 if (el.TryGetProperty("responses", out var resp))
                 {
@@ -134,8 +132,7 @@ class Program
                 }
             }
             foreach (var prop in el.EnumerateObject())
-                if (prop.Value.ValueKind is JsonValueKind.Object or JsonValueKind.Array)
-                    ExtractCustomFields(prop.Value, onMatch);
+                ExtractCustomFields(prop.Value, onMatch);
         }
         else if (el.ValueKind == JsonValueKind.Array)
         {
