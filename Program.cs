@@ -60,6 +60,10 @@ namespace SafetyCultureMondayIntegration
                 new JsonSerializerOptions { PropertyNameCaseInsensitive = true }
             )!;
 
+            // Trim tokens
+            cfg.SafetyCulture.ApiToken = cfg.SafetyCulture.ApiToken.Trim();
+            cfg.Monday.ApiToken = cfg.Monday.ApiToken.Trim();
+
             // 1) Prepare HTTP clients
             using var sc = new HttpClient { BaseAddress = new Uri(cfg.SafetyCulture.BaseUrl) };
             sc.DefaultRequestHeaders.Authorization =
@@ -72,10 +76,9 @@ namespace SafetyCultureMondayIntegration
                 new MediaTypeWithQualityHeaderValue("application/json")
             );
 
-            // 2) Open and migrate SQLite
+            // 2) Open & migrate SQLite
             using var db = new SqliteConnection(cfg.Database.ConnectionString);
             db.Open();
-
             using (var cmd = db.CreateCommand())
             {
                 cmd.CommandText = @"
@@ -87,65 +90,42 @@ CREATE TABLE IF NOT EXISTS inspections (
                 cmd.ExecuteNonQuery();
             }
 
-            // 3) Compute cutoff from completed_at
+            // 3) Compute cutoff
             DateTimeOffset cutoff = DateTimeOffset.UtcNow.Date;
             using (var cmd = db.CreateCommand())
             {
                 cmd.CommandText = "SELECT MAX(completed_at) FROM inspections;";
                 var o = cmd.ExecuteScalar() as string;
-                if (o != null && DateTimeOffset.TryParse(o, out var last))
+                if (!string.IsNullOrEmpty(o) && DateTimeOffset.TryParse(o, out var last))
                     cutoff = last;
             }
             Console.WriteLine($"Syncing audits completed since {cutoff:O}\n");
 
             // 4) Fetch modified summary
             var sinceIso = cutoff.ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ss.fffZ");
-            var searchUrl = $"/audits/search?template={cfg.SafetyCulture.TemplateId}"
-                          + "&field=audit_id&field=modified_at"
-                          + $"&modified_after={Uri.EscapeDataString(sinceIso)}";
+            var searchUrl = $"/audits/search?template={cfg.SafetyCulture.TemplateId}&field=audit_id&field=modified_at&modified_after={Uri.EscapeDataString(sinceIso)}";
 
             Console.WriteLine($"DEBUG: GET {searchUrl}");
             var listResp = await sc.GetAsync(searchUrl);
-            Console.WriteLine($"DEBUG: Response {listResp.StatusCode}");
             var listJson = await listResp.Content.ReadAsStringAsync();
             Console.WriteLine($"DEBUG: Summary JSON:\n{listJson}\n");
-
             listResp.EnsureSuccessStatusCode();
+
             using var listDoc = JsonDocument.Parse(listJson);
-            var summaries = listDoc.RootElement.GetProperty("audits")
-                              .EnumerateArray().ToList();
+            var summaries = listDoc.RootElement.GetProperty("audits").EnumerateArray().ToList();
             Console.WriteLine($"Found {summaries.Count} modified audit summaries.\n");
 
             // 5) Process each summary
             foreach (var s in summaries)
             {
-                Console.WriteLine($"---- RAW SUMMARY ELEMENT:\n{s}\n");
-
-                if (!s.TryGetProperty("audit_id", out var idE))
-                {
-                    Console.WriteLine("  → Skipping: no audit_id");
-                    continue;
-                }
-                if (!s.TryGetProperty("modified_at", out var mE))
-                {
-                    Console.WriteLine("  → Skipping: no modified_at");
-                    continue;
-                }
-
-                var auditId = idE.GetString()!;
-                Console.WriteLine($"  audit_id = {auditId}");
-                if (!DateTimeOffset.TryParse(mE.GetString(), out var modDt))
-                {
-                    Console.WriteLine($"  → Skipping: cannot parse modified_at '{mE.GetString()}'");
-                    continue;
-                }
-                Console.WriteLine($"  modified_at = {modDt:O}");
+                var auditId = s.GetProperty("audit_id").GetString()!;
+                var modDt = DateTimeOffset.Parse(s.GetProperty("modified_at").GetString()!);
+                Console.WriteLine($"---- Processing audit_id={auditId}, modified_at={modDt:O} ----");
 
                 // 5a) Fetch full audit
                 var detailUrl = $"/audits/{auditId}";
                 Console.WriteLine($"DEBUG: GET {detailUrl}");
                 var detResp = await sc.GetAsync(detailUrl);
-                Console.WriteLine($"DEBUG: Response {detResp.StatusCode}");
                 var detJson = await detResp.Content.ReadAsStringAsync();
                 Console.WriteLine($"DEBUG: Detail JSON:\n{detJson}\n");
                 detResp.EnsureSuccessStatusCode();
@@ -154,52 +134,15 @@ CREATE TABLE IF NOT EXISTS inspections (
                 var root = detDoc.RootElement;
                 var ad = root.GetProperty("audit_data");
 
-                // 5b) Check completion_status
-                if (!ad.TryGetProperty("completion_status", out var cs))
-                {
-                    Console.WriteLine("  → Skipping: no completion_status");
-                    continue;
-                }
-                var status = cs.GetString()!;
-                Console.WriteLine($"  completion_status = {status}");
-                if (!string.Equals(status, "COMPLETED", StringComparison.OrdinalIgnoreCase))
-                {
-                    Console.WriteLine("  → Skipping: not COMPLETED");
-                    continue;
-                }
-
-                // 5c) Determine completed date
-                string? compS = null;
-                if (ad.TryGetProperty("completed_date", out var cd))
-                {
-                    compS = cd.GetString();
-                    Console.WriteLine($"  completed_date = {compS}");
-                }
-                else if (ad.TryGetProperty("completed_at", out var ca))
-                {
-                    compS = ca.GetString();
-                    Console.WriteLine($"  completed_at = {compS}");
-                }
-                else
-                {
-                    Console.WriteLine("  → Skipping: no completed_date or completed_at");
-                    continue;
-                }
-
-                if (!DateTimeOffset.TryParse(compS, out var compDt))
-                {
-                    Console.WriteLine($"  → Skipping: cannot parse completion '{compS}'");
-                    continue;
-                }
-                Console.WriteLine($"  parsed completion = {compDt:O}");
-                if (compDt <= cutoff)
-                {
-                    Console.WriteLine($"  → Skipping: completion {compDt:O} <= cutoff {cutoff:O}");
-                    continue;
-                }
+                // 5b) Determine status & completion
+                var status = ad.TryGetProperty("completion_status", out var cs) ? cs.GetString()! : "UNKNOWN";
+                var compS = ad.TryGetProperty("completed_date", out var cd) ? cd.GetString()!
+                           : ad.TryGetProperty("completed_at", out var ca) ? ca.GetString()!
+                           : modDt.ToString("o");
+                var compDt = DateTimeOffset.TryParse(compS, out var tmp) ? tmp : modDt;
+                Console.WriteLine($"  status={status}, effective completed_at={compDt:O}");
 
                 // 6) Upsert into SQLite
-                Console.WriteLine($"  Upserting into SQLite…");
                 using (var up = db.CreateCommand())
                 {
                     up.CommandText = @"
@@ -212,62 +155,38 @@ ON CONFLICT(audit_id) DO UPDATE
                     up.Parameters.AddWithValue("$p", root.GetRawText());
                     up.ExecuteNonQuery();
                 }
-                Console.WriteLine($"  SQLite upsert complete.\n");
+                Console.WriteLine("  SQLite upsert complete.\n");
 
                 // 7) Build Monday.com columns
                 var cols = new Dictionary<string, object>
                 {
                     [cfg.Monday.ColumnAuditId] = auditId,
-                    [cfg.Monday.ColumnCreated] = root.GetProperty("created_at").GetString() ?? "",
+                    [cfg.Monday.ColumnCreated] = root.GetProperty("created_at").GetString() ?? string.Empty,
                     [cfg.Monday.ColumnStatus] = status,
                     [cfg.Monday.ColumnScore] = ad.GetProperty("score_percentage").GetDouble(),
                     [cfg.Monday.ColumnCompleted] = compDt.ToString("yyyy-MM-dd")
                 };
-
-                ExtractCustom(root, (lbl, val) => {
-                    Console.WriteLine($"    Found custom field {lbl}: {val}");
+                ExtractCustom(root, (lbl, val) =>
+                {
                     if (lbl.Equals("Part-Number", StringComparison.OrdinalIgnoreCase))
                         cols[cfg.Monday.ColumnPartNumber] = val;
-                    if (lbl.Equals("Quantity", StringComparison.OrdinalIgnoreCase)
-                        && double.TryParse(val, out var q))
+                    if (lbl.Equals("Quantity", StringComparison.OrdinalIgnoreCase) && double.TryParse(val, out var q))
                         cols[cfg.Monday.ColumnQuantity] = q;
+                    if (lbl.Equals("Transaction Type", StringComparison.OrdinalIgnoreCase))
+                        cols[cfg.Monday.ColumnTransaction] = val;
                 });
-
-                if (ad.TryGetProperty("item_responses", out var ir) && ir.ValueKind == JsonValueKind.Array)
-                {
-                    foreach (var r2 in ir.EnumerateArray())
-                    {
-                        var label = r2.GetProperty("label").GetString();
-                        if (label == "Transaction Type"
-                            && r2.TryGetProperty("response_data", out var rd)
-                            && rd.TryGetProperty("choices", out var ch)
-                            && ch.ValueKind == JsonValueKind.Array
-                            && ch.GetArrayLength() > 0)
-                        {
-                            var tv = ch[0].GetProperty("value").GetString()!;
-                            Console.WriteLine($"    Found Transaction Type: {tv}");
-                            cols[cfg.Monday.ColumnTransaction] = tv;
-                            break;
-                        }
-                    }
-                }
-
-                Console.WriteLine($"  Final column payload:\n  {JsonSerializer.Serialize(cols)}\n");
+                Console.WriteLine($"  Final column payload:\n{JsonSerializer.Serialize(cols, new JsonSerializerOptions { WriteIndented = true })}\n");
 
                 // 8) Upsert into Monday.com
-                var existing = await FindMondayItem(mc,
-                    cfg.Monday.BoardId,
-                    cfg.Monday.ColumnAuditId,
-                    auditId);
-
+                var existing = await FindMondayItem(mc, cfg.Monday.BoardId, cfg.Monday.ColumnAuditId, auditId);
                 if (existing != null)
                 {
-                    Console.WriteLine($"  DEBUG: would update item {existing}");
+                    Console.WriteLine($"  DEBUG: Updating item {existing}");
                     await ChangeMultiple(mc, existing, cfg.Monday.BoardId, cols);
                 }
                 else
                 {
-                    Console.WriteLine("  DEBUG: would create new item");
+                    Console.WriteLine("  DEBUG: Creating new item");
                     await CreateItem(mc, cfg.Monday.BoardId, $"Audit {auditId}", cols);
                 }
 
@@ -281,126 +200,107 @@ ON CONFLICT(audit_id) DO UPDATE
         {
             if (el.ValueKind == JsonValueKind.Object)
             {
-                if (el.TryGetProperty("label", out var L)
-                 && el.TryGetProperty("responses", out var R))
+                if (el.TryGetProperty("label", out var L) && el.TryGetProperty("responses", out var R))
                 {
                     var lbl = L.GetString()!;
                     if (R.TryGetProperty("text", out var t)) onMatch(lbl, t.GetString()!);
                     if (R.TryGetProperty("choice", out var c)) onMatch(lbl, c.GetString()!);
                     if (R.TryGetProperty("number", out var n)) onMatch(lbl, n.ToString());
                 }
-                foreach (var p in el.EnumerateObject())
-                    ExtractCustom(p.Value, onMatch);
+                foreach (var p in el.EnumerateObject()) ExtractCustom(p.Value, onMatch);
             }
             else if (el.ValueKind == JsonValueKind.Array)
-            {
-                foreach (var i in el.EnumerateArray())
-                    ExtractCustom(i, onMatch);
-            }
+                foreach (var i in el.EnumerateArray()) ExtractCustom(i, onMatch);
         }
 
         static async Task<string?> FindMondayItem(
-            HttpClient client,
-            int board,
-            string col,
-            string val)
+    HttpClient client,
+    int board,
+    string col,
+    string val)
         {
-            const string query = """
-              query($b:ID!,$c:String!,$v:String!){
-                items_by_column_values(
-                  board_id:$b,column_id:$c,column_value:$v
-                ){id}
-              }
-              """;
+            // Use the new v2 field and argument shape
+            const string query =
+              "query($boardId:ID!,$columnId:String!,$columnValue:String!){"
+            + "  items_page_by_column_values("
+            + "    board_id:$boardId,"
+            + "    columns:[{column_id:$columnId,column_values:[$columnValue]}],"
+            + "    limit:1"
+            + "  ){ items { id } }"
+            + "}";
 
             var payload = JsonSerializer.Serialize(new
             {
                 query,
-                variables = new { b = board, c = col, v = val }
-            });
-
-            Console.WriteLine($"  DEBUG: find payload:\n  {payload}");
-            var resp = await client.PostAsync("",
-              new StringContent(payload, Encoding.UTF8, "application/json"));
-            var body = await resp.Content.ReadAsStringAsync();
-            Console.WriteLine($"  DEBUG: find response:\n  {body}");
-            if (!resp.IsSuccessStatusCode) return null;
-
-            using var d = JsonDocument.Parse(body);
-            var arr = d.RootElement
-                       .GetProperty("data")
-                       .GetProperty("items_by_column_values")
-                       .EnumerateArray();
-            return arr.Select(x => x.GetProperty("id").GetString()).FirstOrDefault();
-        }
-
-        static async Task CreateItem(
-            HttpClient client,
-            int board,
-            string name,
-            Dictionary<string, object> cols)
-        {
-            const string m = """
-              mutation($b:ID!,$n:String!,$c:JSON!){
-                create_item(
-                  board_id:$b,
-                  item_name:$n,
-                  column_values:$c
-                ){id}
-              }
-              """;
-
-            var payload = JsonSerializer.Serialize(new
-            {
-                query = m,
                 variables = new
                 {
-                    b = board,
-                    n = name,
-                    c = JsonSerializer.Serialize(cols)
+                    boardId = board,
+                    columnId = col,
+                    columnValue = val
                 }
             });
 
-            Console.WriteLine($"  DEBUG: create payload:\n  {payload}");
-            var resp = await client.PostAsync("",
-              new StringContent(payload, Encoding.UTF8, "application/json"));
+            Console.WriteLine("=== Find Payload ===");
+            Console.WriteLine(payload);
+            Console.WriteLine("=== Request Headers ===");
+            foreach (var h in client.DefaultRequestHeaders)
+                Console.WriteLine($"{h.Key}: {string.Join(",", h.Value)}");
+
+            var resp = await client.PostAsync(
+                "",
+                new StringContent(payload, Encoding.UTF8, "application/json")
+            );
             var body = await resp.Content.ReadAsStringAsync();
-            Console.WriteLine($"  DEBUG: create response:\n  {body}");
+            Console.WriteLine("=== Find Response ===");
+            Console.WriteLine(body);
+
+            // Try to parse JSON
+            using var doc = JsonDocument.Parse(body);
+            var root = doc.RootElement;
+
+            // 1) If GraphQL errors are present, log & bail out:
+            if (root.TryGetProperty("errors", out var errs))
+            {
+                Console.WriteLine("GraphQL errors:");
+                foreach (var err in errs.EnumerateArray())
+                    Console.WriteLine("  - " + err.GetProperty("message").GetString());
+                return null;
+            }
+
+            // 2) Drill into data → items_page_by_column_values → items
+            if (!root.TryGetProperty("data", out var data) ||
+                !data.TryGetProperty("items_page_by_column_values", out var page))
+            {
+                Console.WriteLine("No 'items_page_by_column_values' in response.");
+                return null;
+            }
+
+            if (!page.TryGetProperty("items", out var itemsArr) ||
+                itemsArr.GetArrayLength() == 0)
+            {
+                Console.WriteLine("No items returned.");
+                return null;
+            }
+
+            // 3) Pull out the first ID
+            return itemsArr.EnumerateArray()
+                           .Select(item => item.GetProperty("id").GetString())
+                           .FirstOrDefault();
+        }
+
+        static async Task CreateItem(HttpClient client, int board, string name, Dictionary<string, object> cols)
+        {
+            const string m = "mutation($b:ID!,$n:String!,$c:JSON!){create_item(board_id:$b,item_name:$n,column_values:$c){id}}";
+            var payload = JsonSerializer.Serialize(new { query = m, variables = new { b = board, n = name, c = JsonSerializer.Serialize(cols) } });
+            var resp = await client.PostAsync("", new StringContent(payload, Encoding.UTF8, "application/json"));
             resp.EnsureSuccessStatusCode();
         }
 
-        static async Task ChangeMultiple(
-            HttpClient client,
-            string itemId,
-            int board,
-            Dictionary<string, object> cols)
+        static async Task ChangeMultiple(HttpClient client, string itemId, int board, Dictionary<string, object> cols)
         {
-            const string m = """
-              mutation($i:ID!,$b:ID!,$c:JSON!){
-                change_multiple_column_values(
-                  item_id:$i,
-                  board_id:$b,
-                  column_values:$c
-                ){id}
-              }
-              """;
-
-            var payload = JsonSerializer.Serialize(new
-            {
-                query = m,
-                variables = new
-                {
-                    i = itemId,
-                    b = board,
-                    c = JsonSerializer.Serialize(cols)
-                }
-            });
-
-            Console.WriteLine($"  DEBUG: update payload:\n  {payload}");
-            var resp = await client.PostAsync("",
-              new StringContent(payload, Encoding.UTF8, "application/json"));
-            var body = await resp.Content.ReadAsStringAsync();
-            Console.WriteLine($"  DEBUG: update response:\n  {body}");
+            const string m = "mutation($i:ID!,$b:ID!,$c:JSON!){change_multiple_column_values(item_id:$i,board_id:$b,column_values:$c){id}}";
+            var payload = JsonSerializer.Serialize(new { query = m, variables = new { i = itemId, b = board, c = JsonSerializer.Serialize(cols) } });
+            var resp = await client.PostAsync("", new StringContent(payload, Encoding.UTF8, "application/json"));
             resp.EnsureSuccessStatusCode();
         }
     }
