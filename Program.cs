@@ -27,14 +27,14 @@ namespace SafetyCultureMondayIntegration
     {
         public string ApiToken { get; set; } = "";
         public int BoardId { get; set; }
-        public string ColumnName { get; set; } = "name";            // built-in name
+        public string ColumnName { get; set; } = "name";
         public string ColumnCreated { get; set; } = "date4";
-        public string ColumnStatus { get; set; } = "color_mks6wn31";
-        public string ColumnScore { get; set; } = "color_mks6vcdd";
-        public string ColumnCompleted { get; set; } = "color_mks6p6hz";
-        public string ColumnPartNumber { get; set; } = "color_mks6kz8f";
-        public string ColumnQuantity { get; set; } = "color_mks6p9jh";
-        public string ColumnTransaction { get; set; } = "color_mks6z1a6";
+        public string ColumnCompleted { get; set; } = "date_mksahg27";
+        public string ColumnPartNumber { get; set; } = "text_mksaxab";
+        public string ColumnTransaction { get; set; } = "text_mksakm5d";
+        public string ColumnStatus { get; set; } = "text_mksabyss";
+        public string ColumnQuantity { get; set; } = "numeric_mksazv5r";
+        public string ColumnScore { get; set; } = "numeric_mksscore";
     }
 
     class Program
@@ -70,9 +70,11 @@ namespace SafetyCultureMondayIntegration
             var searchUrl = $"/audits/search?template={Uri.EscapeDataString(cfg.SafetyCulture.TemplateId)}"
                           + "&field=audit_id&field=modified_at"
                           + "&modified_after=1970-01-01T00:00:00Z";
+
             var listResp = await sc.GetAsync(searchUrl);
             listResp.EnsureSuccessStatusCode();
             var listJson = await listResp.Content.ReadAsStringAsync();
+
             var audits = JsonDocument.Parse(listJson)
                                      .RootElement
                                      .GetProperty("audits")
@@ -102,7 +104,8 @@ namespace SafetyCultureMondayIntegration
                         .ToString("yyyy-MM-dd");
 
                     string statusValue = ad.TryGetProperty("completion_status", out var cs)
-                        ? cs.GetString()! : "UNKNOWN";
+                        ? cs.GetString()!
+                        : "UNKNOWN";
 
                     double scorePct = ad.GetProperty("score_percentage").GetDouble();
 
@@ -111,10 +114,11 @@ namespace SafetyCultureMondayIntegration
                         : ad.TryGetProperty("completed_at", out var ca)
                           ? ca.GetString()!
                           : DateTimeOffset.UtcNow.ToString("o");
+
                     string completedDate = DateTimeOffset.Parse(compRaw)
                                             .ToString("yyyy-MM-dd");
 
-                    // c) Headers
+                    // c) Header-items
                     string partNumber = "";
                     int quantity = 0;
                     string transaction = "";
@@ -123,13 +127,13 @@ namespace SafetyCultureMondayIntegration
                     {
                         foreach (var hi in headers.EnumerateArray())
                         {
-                            if (!hi.TryGetProperty("label", out var lblEl)
-                             || !hi.TryGetProperty("responses", out var respEl))
+                            if (!hi.TryGetProperty("label", out var lblEl) ||
+                                !hi.TryGetProperty("responses", out var respEl))
                                 continue;
 
                             var lbl = lblEl.GetString()!;
                             if (lbl.Equals("Part-Number", StringComparison.OrdinalIgnoreCase)
-                             && respEl.TryGetProperty("text", out var txtP))
+                              && respEl.TryGetProperty("text", out var txtP))
                             {
                                 partNumber = txtP.GetString()!;
                             }
@@ -146,31 +150,39 @@ namespace SafetyCultureMondayIntegration
                             {
                                 var choice = sel[0];
                                 transaction = choice.TryGetProperty("label", out var l2)
-                                            ? l2.GetString()!
-                                            : choice.GetProperty("value").GetString()!;
+                                              ? l2.GetString()!
+                                              : choice.GetProperty("value").GetString()!;
                             }
                         }
                     }
 
-                    // d) Build column_values (omit audit_id)
+                    // d) Build column_values with correct JSON shapes
                     var cols = new Dictionary<string, object>
                     {
+                        // date columns
                         [cfg.Monday.ColumnCreated] = new { date = createdDate },
                         [cfg.Monday.ColumnCompleted] = new { date = completedDate },
-                        [cfg.Monday.ColumnStatus] = new { label = statusValue },
-                        [cfg.Monday.ColumnScore] = scorePct
+
+                        // text columns
+                        [cfg.Monday.ColumnStatus] = statusValue,
+                        [cfg.Monday.ColumnPartNumber] = partNumber,
+                        [cfg.Monday.ColumnTransaction] = transaction,
+
+                        // number columns
+                        [cfg.Monday.ColumnScore] = scorePct,
+                        [cfg.Monday.ColumnQuantity] = quantity
                     };
-                    if (!string.IsNullOrEmpty(partNumber))
-                        cols[cfg.Monday.ColumnPartNumber] = partNumber;
-                    if (quantity > 0)
-                        cols[cfg.Monday.ColumnQuantity] = quantity;
-                    if (!string.IsNullOrEmpty(transaction))
-                        cols[cfg.Monday.ColumnTransaction] = new { label = transaction };
+
+                    // clean out any "empty"
+                    if (string.IsNullOrEmpty(partNumber)) cols.Remove(cfg.Monday.ColumnPartNumber);
+                    if (string.IsNullOrEmpty(transaction)) cols.Remove(cfg.Monday.ColumnTransaction);
+                    if (string.IsNullOrEmpty(statusValue)) cols.Remove(cfg.Monday.ColumnStatus);
+                    if (quantity == 0) cols.Remove(cfg.Monday.ColumnQuantity);
 
                     Console.WriteLine(">>> column_values to send:\n"
                         + JsonSerializer.Serialize(cols, new JsonSerializerOptions { WriteIndented = true }));
 
-                    // e) Upsert via `name`
+                    // e) Upsert via the `name` column
                     var existing = await TryFindItem(mc, cfg.Monday.BoardId, cfg.Monday.ColumnName, itemName);
                     if (existing != null)
                     {
@@ -193,6 +205,7 @@ namespace SafetyCultureMondayIntegration
             Console.WriteLine("All done.");
         }
 
+        // Finds an item by column/value, returns null if not found.
         static async Task<string?> TryFindItem(
             HttpClient client,
             int boardId,
@@ -214,20 +227,19 @@ query($boardId:ID!,$columnId:String!,$columnValue:String!){
             });
 
             Console.WriteLine(">>> FIND payload:\n" + payload);
-            var resp = await client.PostAsync("", new StringContent(payload, Encoding.UTF8, "application/json"));
+            var resp = await client.PostAsync(
+                "", new StringContent(payload, Encoding.UTF8, "application/json"));
             var body = await resp.Content.ReadAsStringAsync();
             Console.WriteLine(">>> FIND response:\n" + body);
 
             using var doc = JsonDocument.Parse(body);
-            var data = doc.RootElement.GetProperty("data")
-                                      .GetProperty("items_page_by_column_values")
-                                      .GetProperty("items");
+            var items = doc.RootElement
+                           .GetProperty("data")
+                           .GetProperty("items_page_by_column_values")
+                           .GetProperty("items");
 
-            // **Safely** handle empty list:
-            if (data.ValueKind == JsonValueKind.Array && data.GetArrayLength() > 0)
-            {
-                return data[0].GetProperty("id").GetString();
-            }
+            if (items.ValueKind == JsonValueKind.Array && items.GetArrayLength() > 0)
+                return items[0].GetProperty("id").GetString();
             return null;
         }
 
@@ -241,7 +253,7 @@ query($boardId:ID!,$columnId:String!,$columnValue:String!){
 mutation($b:ID!,$n:String!,$c:JSON!){
   create_item(board_id:$b,item_name:$n,column_values:$c){id}
 }";
-            // JSON! expects a string here:
+            // Monday expects the JSON blob as a _string_ for JSON!:
             var colJson = JsonSerializer.Serialize(cols);
             var payload = JsonSerializer.Serialize(new
             {
@@ -250,7 +262,8 @@ mutation($b:ID!,$n:String!,$c:JSON!){
             });
 
             Console.WriteLine(">>> CREATE payload:\n" + payload);
-            var resp = await client.PostAsync("", new StringContent(payload, Encoding.UTF8, "application/json"));
+            var resp = await client.PostAsync(
+                "", new StringContent(payload, Encoding.UTF8, "application/json"));
             var body = await resp.Content.ReadAsStringAsync();
             Console.WriteLine(">>> CREATE response:\n" + body);
             resp.EnsureSuccessStatusCode();
@@ -274,7 +287,8 @@ mutation($i:ID!,$b:ID!,$c:JSON!){
             });
 
             Console.WriteLine(">>> CHANGE payload:\n" + payload);
-            var resp = await client.PostAsync("", new StringContent(payload, Encoding.UTF8, "application/json"));
+            var resp = await client.PostAsync(
+                "", new StringContent(payload, Encoding.UTF8, "application/json"));
             var body = await resp.Content.ReadAsStringAsync();
             Console.WriteLine(">>> CHANGE response:\n" + body);
             resp.EnsureSuccessStatusCode();
