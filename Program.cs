@@ -12,8 +12,8 @@ namespace SafetyCultureMondayIntegration
 {
     public class AppConfig
     {
-        public SafetyCultureConfig SafetyCulture { get; set; } = new SafetyCultureConfig();
-        public MondayConfig Monday { get; set; } = new MondayConfig();
+        public SafetyCultureConfig SafetyCulture { get; set; } = new();
+        public MondayConfig Monday { get; set; } = new();
     }
 
     public class SafetyCultureConfig
@@ -27,21 +27,22 @@ namespace SafetyCultureMondayIntegration
     {
         public string ApiToken { get; set; } = "";
         public int BoardId { get; set; }
+
         public string ColumnName { get; set; } = "name";
         public string ColumnCreated { get; set; } = "date4";
         public string ColumnCompleted { get; set; } = "date_mksahg27";
+        public string ColumnStatus { get; set; } = "text_mksabyss";
+        public string ColumnScore { get; set; } = "numeric_mksczk53";
+        public string ColumnQuantity { get; set; } = "numeric_mkscjk7r";
         public string ColumnPartNumber { get; set; } = "text_mksaxab";
         public string ColumnTransaction { get; set; } = "text_mksakm5d";
-        public string ColumnStatus { get; set; } = "text_mksabyss";
-        public string ColumnQuantity { get; set; } = "numeric_mksazv5r";
-        public string ColumnScore { get; set; } = "numeric_mksscore";
     }
 
     class Program
     {
         static async Task Main()
         {
-            // 0) Load config
+            // Load config
             if (!File.Exists("appsettings.json"))
             {
                 Console.Error.WriteLine("ERROR: appsettings.json not found");
@@ -52,29 +53,29 @@ namespace SafetyCultureMondayIntegration
                 new JsonSerializerOptions { PropertyNameCaseInsensitive = true }
             )!;
 
+            // Trim tokens
             cfg.SafetyCulture.ApiToken = cfg.SafetyCulture.ApiToken.Trim();
             cfg.Monday.ApiToken = cfg.Monday.ApiToken.Trim();
 
-            // 1) HTTP clients
+            // SafetyCulture HTTP client
             using var sc = new HttpClient { BaseAddress = new Uri(cfg.SafetyCulture.BaseUrl) };
             sc.DefaultRequestHeaders.Authorization =
                 new AuthenticationHeaderValue("Bearer", cfg.SafetyCulture.ApiToken);
 
+            // Monday.com HTTP client
             using var mc = new HttpClient { BaseAddress = new Uri("https://api.monday.com/v2") };
             mc.DefaultRequestHeaders.Authorization =
                 new AuthenticationHeaderValue("Bearer", cfg.Monday.ApiToken);
             mc.DefaultRequestHeaders.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
 
-            // 2) Fetch audits
-            Console.WriteLine("Fetching all audits...");
-            var searchUrl = $"/audits/search?template={Uri.EscapeDataString(cfg.SafetyCulture.TemplateId)}"
-                          + "&field=audit_id&field=modified_at"
-                          + "&modified_after=1970-01-01T00:00:00Z";
-
-            var listResp = await sc.GetAsync(searchUrl);
+            // Fetch audits
+            Console.WriteLine("Fetching all audits…");
+            var listResp = await sc.GetAsync(
+                $"/audits/search?template={Uri.EscapeDataString(cfg.SafetyCulture.TemplateId)}" +
+                "&field=audit_id&field=modified_at&modified_after=1970-01-01T00:00:00Z"
+            );
             listResp.EnsureSuccessStatusCode();
             var listJson = await listResp.Content.ReadAsStringAsync();
-
             var audits = JsonDocument.Parse(listJson)
                                      .RootElement
                                      .GetProperty("audits")
@@ -82,7 +83,7 @@ namespace SafetyCultureMondayIntegration
                                      .ToList();
             Console.WriteLine($"Found {audits.Count} audits.\n");
 
-            // 3) Process each
+            // Process each audit
             foreach (var summary in audits)
             {
                 string auditId = summary.GetProperty("audit_id").GetString()!;
@@ -91,98 +92,80 @@ namespace SafetyCultureMondayIntegration
 
                 try
                 {
-                    // a) Fetch full audit
+                    // Get full audit
                     var detResp = await sc.GetAsync($"/audits/{Uri.EscapeDataString(auditId)}");
                     detResp.EnsureSuccessStatusCode();
                     var detJson = await detResp.Content.ReadAsStringAsync();
                     var root = JsonDocument.Parse(detJson).RootElement;
                     var ad = root.GetProperty("audit_data");
 
-                    // b) Core fields
-                    string createdDate = DateTimeOffset
+                    // Core fields
+                    var createdDate = DateTimeOffset
                         .Parse(root.GetProperty("created_at").GetString()!)
                         .ToString("yyyy-MM-dd");
 
-                    string statusValue = ad.TryGetProperty("completion_status", out var cs)
-                        ? cs.GetString()!
-                        : "UNKNOWN";
+                    var rawScore = ad.GetProperty("score_percentage").GetDouble();
+                    var scorePct = Convert.ToInt32(Math.Round(rawScore));
 
-                    double scorePct = ad.GetProperty("score_percentage").GetDouble();
-
-                    string compRaw = ad.TryGetProperty("completed_date", out var cd)
+                    var compRaw = ad.TryGetProperty("completed_date", out var cd)
                         ? cd.GetString()!
                         : ad.TryGetProperty("completed_at", out var ca)
                           ? ca.GetString()!
                           : DateTimeOffset.UtcNow.ToString("o");
+                    var completedDate = DateTimeOffset.Parse(compRaw).ToString("yyyy-MM-dd");
 
-                    string completedDate = DateTimeOffset.Parse(compRaw)
-                                            .ToString("yyyy-MM-dd");
+                    var statusValue = ad.TryGetProperty("completion_status", out var cs)
+                        ? cs.GetString()! : "UNKNOWN";
 
-                    // c) Header-items
+                    // Header items
                     string partNumber = "";
                     int quantity = 0;
                     string transaction = "";
 
                     if (root.TryGetProperty("header_items", out var headers))
-                    {
                         foreach (var hi in headers.EnumerateArray())
                         {
-                            if (!hi.TryGetProperty("label", out var lblEl) ||
-                                !hi.TryGetProperty("responses", out var respEl))
+                            if (!hi.TryGetProperty("label", out var lbl) ||
+                                !hi.TryGetProperty("responses", out var resp))
                                 continue;
-
-                            var lbl = lblEl.GetString()!;
-                            if (lbl.Equals("Part-Number", StringComparison.OrdinalIgnoreCase)
-                              && respEl.TryGetProperty("text", out var txtP))
-                            {
-                                partNumber = txtP.GetString()!;
-                            }
-                            else if (lbl.Equals("Quantity", StringComparison.OrdinalIgnoreCase)
-                                  && respEl.TryGetProperty("text", out var txtQ)
-                                  && int.TryParse(txtQ.GetString(), out var qv))
-                            {
+                            var label = lbl.GetString()!;
+                            if (label.Equals("Part-Number", StringComparison.OrdinalIgnoreCase)
+                             && resp.TryGetProperty("text", out var tP))
+                                partNumber = tP.GetString()!;
+                            else if (label.Equals("Quantity", StringComparison.OrdinalIgnoreCase)
+                                  && resp.TryGetProperty("text", out var tQ)
+                                  && int.TryParse(tQ.GetString(), out var qv))
                                 quantity = qv;
-                            }
-                            else if (lbl.StartsWith("Trans", StringComparison.OrdinalIgnoreCase)
-                                  && respEl.TryGetProperty("selected", out var sel)
+                            else if (label.StartsWith("Trans", StringComparison.OrdinalIgnoreCase)
+                                  && resp.TryGetProperty("selected", out var sel)
                                   && sel.ValueKind == JsonValueKind.Array
                                   && sel.GetArrayLength() > 0)
                             {
                                 var choice = sel[0];
                                 transaction = choice.TryGetProperty("label", out var l2)
-                                              ? l2.GetString()!
-                                              : choice.GetProperty("value").GetString()!;
+                                            ? l2.GetString()!
+                                            : choice.GetProperty("value").GetString()!;
                             }
                         }
-                    }
 
-                    // d) Build column_values with correct JSON shapes
+                    // Build column_values
                     var cols = new Dictionary<string, object>
                     {
-                        // date columns
                         [cfg.Monday.ColumnCreated] = new { date = createdDate },
                         [cfg.Monday.ColumnCompleted] = new { date = completedDate },
 
-                        // text columns
                         [cfg.Monday.ColumnStatus] = statusValue,
                         [cfg.Monday.ColumnPartNumber] = partNumber,
                         [cfg.Monday.ColumnTransaction] = transaction,
 
-                        // number columns
                         [cfg.Monday.ColumnScore] = scorePct,
                         [cfg.Monday.ColumnQuantity] = quantity
                     };
 
-                    // clean out any "empty"
-                    if (string.IsNullOrEmpty(partNumber)) cols.Remove(cfg.Monday.ColumnPartNumber);
-                    if (string.IsNullOrEmpty(transaction)) cols.Remove(cfg.Monday.ColumnTransaction);
-                    if (string.IsNullOrEmpty(statusValue)) cols.Remove(cfg.Monday.ColumnStatus);
-                    if (quantity == 0) cols.Remove(cfg.Monday.ColumnQuantity);
-
-                    Console.WriteLine(">>> column_values to send:\n"
+                    Console.WriteLine(">>> column_values:\n"
                         + JsonSerializer.Serialize(cols, new JsonSerializerOptions { WriteIndented = true }));
 
-                    // e) Upsert via the `name` column
+                    // Try to find existing item by `name`
                     var existing = await TryFindItem(mc, cfg.Monday.BoardId, cfg.Monday.ColumnName, itemName);
                     if (existing != null)
                     {
@@ -197,42 +180,44 @@ namespace SafetyCultureMondayIntegration
                 }
                 catch (Exception ex)
                 {
-                    Console.WriteLine($"!!! ERROR for {auditId}: {ex.Message}");
+                    Console.WriteLine($"!!! ERROR for {auditId}: {ex}");
                 }
+
                 Console.WriteLine();
             }
 
             Console.WriteLine("All done.");
         }
 
-        // Finds an item by column/value, returns null if not found.
-        static async Task<string?> TryFindItem(
-            HttpClient client,
-            int boardId,
-            string columnId,
-            string columnValue)
+        static async Task<string?> TryFindItem(HttpClient client, int boardId, string columnId, string columnValue)
         {
-            const string query = @"
+            const string Q = @"
 query($boardId:ID!,$columnId:String!,$columnValue:String!){
   items_page_by_column_values(
     board_id:$boardId,
     columns:[{column_id:$columnId,column_values:[$columnValue]}],
     limit:1
-  ){ items { id } }
+  ){
+    items { id }
+  }
 }";
             var payload = JsonSerializer.Serialize(new
             {
-                query,
+                query = Q,
                 variables = new { boardId, columnId, columnValue }
             });
 
-            Console.WriteLine(">>> FIND payload:\n" + payload);
-            var resp = await client.PostAsync(
-                "", new StringContent(payload, Encoding.UTF8, "application/json"));
+            var resp = await client.PostAsync("", new StringContent(payload, Encoding.UTF8, "application/json"));
             var body = await resp.Content.ReadAsStringAsync();
             Console.WriteLine(">>> FIND response:\n" + body);
 
             using var doc = JsonDocument.Parse(body);
+            if (doc.RootElement.TryGetProperty("errors", out var errs))
+            {
+                Console.WriteLine("GraphQL errors:\n" + errs);
+                return null;
+            }
+
             var items = doc.RootElement
                            .GetProperty("data")
                            .GetProperty("items_page_by_column_values")
@@ -240,58 +225,64 @@ query($boardId:ID!,$columnId:String!,$columnValue:String!){
 
             if (items.ValueKind == JsonValueKind.Array && items.GetArrayLength() > 0)
                 return items[0].GetProperty("id").GetString();
+
             return null;
         }
 
-        static async Task CreateItem(
-            HttpClient client,
-            int boardId,
-            string itemName,
-            Dictionary<string, object> cols)
+        static async Task CreateItem(HttpClient client, int boardId, string itemName, Dictionary<string, object> cols)
         {
-            const string m = @"
+            const string M = @"
 mutation($b:ID!,$n:String!,$c:JSON!){
   create_item(board_id:$b,item_name:$n,column_values:$c){id}
 }";
-            // Monday expects the JSON blob as a _string_ for JSON!:
             var colJson = JsonSerializer.Serialize(cols);
             var payload = JsonSerializer.Serialize(new
             {
-                query = m,
+                query = M,
                 variables = new { b = boardId, n = itemName, c = colJson }
             });
 
-            Console.WriteLine(">>> CREATE payload:\n" + payload);
-            var resp = await client.PostAsync(
-                "", new StringContent(payload, Encoding.UTF8, "application/json"));
+            var resp = await client.PostAsync("", new StringContent(payload, Encoding.UTF8, "application/json"));
             var body = await resp.Content.ReadAsStringAsync();
             Console.WriteLine(">>> CREATE response:\n" + body);
-            resp.EnsureSuccessStatusCode();
+
+            using var doc = JsonDocument.Parse(body);
+            if (doc.RootElement.TryGetProperty("errors", out var errs))
+                throw new Exception("GraphQL errors on create:\n" + errs);
+
+            var id = doc.RootElement.GetProperty("data")
+                                    .GetProperty("create_item")
+                                    .GetProperty("id")
+                                    .GetString();
+            Console.WriteLine($"> Created item #{id}");
         }
 
-        static async Task ChangeMultiple(
-            HttpClient client,
-            string itemId,
-            int boardId,
-            Dictionary<string, object> cols)
+        static async Task ChangeMultiple(HttpClient client, string itemId, int boardId, Dictionary<string, object> cols)
         {
-            const string m = @"
+            const string M = @"
 mutation($i:ID!,$b:ID!,$c:JSON!){
   change_multiple_column_values(item_id:$i,board_id:$b,column_values:$c){id}
 }";
             var colJson = JsonSerializer.Serialize(cols);
             var payload = JsonSerializer.Serialize(new
             {
-                query = m,
+                query = M,
                 variables = new { i = itemId, b = boardId, c = colJson }
             });
 
-            Console.WriteLine(">>> CHANGE payload:\n" + payload);
-            var resp = await client.PostAsync(
-                "", new StringContent(payload, Encoding.UTF8, "application/json"));
+            var resp = await client.PostAsync("", new StringContent(payload, Encoding.UTF8, "application/json"));
             var body = await resp.Content.ReadAsStringAsync();
             Console.WriteLine(">>> CHANGE response:\n" + body);
-            resp.EnsureSuccessStatusCode();
+
+            using var doc = JsonDocument.Parse(body);
+            if (doc.RootElement.TryGetProperty("errors", out var errs))
+                throw new Exception("GraphQL errors on update:\n" + errs);
+
+            var id = doc.RootElement.GetProperty("data")
+                                    .GetProperty("change_multiple_column_values")
+                                    .GetProperty("id")
+                                    .GetString();
+            Console.WriteLine($"> Updated item #{id}");
         }
     }
 }
