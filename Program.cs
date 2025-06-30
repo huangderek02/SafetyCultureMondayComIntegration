@@ -31,7 +31,6 @@ namespace SafetyCultureMondayIntegration
         public string ColumnName { get; set; } = "name";
         public string ColumnCreated { get; set; } = "date4";
         public string ColumnCompleted { get; set; } = "date_mksahg27";
-        public string ColumnStatus { get; set; } = "text_mksabyss";
         public string ColumnScore { get; set; } = "numeric_mksczk53";
         public string ColumnQuantity { get; set; } = "numeric_mkscjk7r";
         public string ColumnPartNumber { get; set; } = "text_mksaxab";
@@ -42,7 +41,7 @@ namespace SafetyCultureMondayIntegration
     {
         static async Task Main()
         {
-            // Load config
+            // 0) Load config
             if (!File.Exists("appsettings.json"))
             {
                 Console.Error.WriteLine("ERROR: appsettings.json not found");
@@ -53,22 +52,22 @@ namespace SafetyCultureMondayIntegration
                 new JsonSerializerOptions { PropertyNameCaseInsensitive = true }
             )!;
 
-            // Trim tokens
+            // Trim API tokens
             cfg.SafetyCulture.ApiToken = cfg.SafetyCulture.ApiToken.Trim();
             cfg.Monday.ApiToken = cfg.Monday.ApiToken.Trim();
 
-            // SafetyCulture HTTP client
+            // 1) SafetyCulture client
             using var sc = new HttpClient { BaseAddress = new Uri(cfg.SafetyCulture.BaseUrl) };
             sc.DefaultRequestHeaders.Authorization =
                 new AuthenticationHeaderValue("Bearer", cfg.SafetyCulture.ApiToken);
 
-            // Monday.com HTTP client
+            // 2) Monday.com client
             using var mc = new HttpClient { BaseAddress = new Uri("https://api.monday.com/v2") };
             mc.DefaultRequestHeaders.Authorization =
                 new AuthenticationHeaderValue("Bearer", cfg.Monday.ApiToken);
             mc.DefaultRequestHeaders.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
 
-            // Fetch audits
+            // 3) Fetch audits
             Console.WriteLine("Fetching all audits…");
             var listResp = await sc.GetAsync(
                 $"/audits/search?template={Uri.EscapeDataString(cfg.SafetyCulture.TemplateId)}" +
@@ -83,7 +82,7 @@ namespace SafetyCultureMondayIntegration
                                      .ToList();
             Console.WriteLine($"Found {audits.Count} audits.\n");
 
-            // Process each audit
+            // 4) Process each
             foreach (var summary in audits)
             {
                 string auditId = summary.GetProperty("audit_id").GetString()!;
@@ -92,37 +91,43 @@ namespace SafetyCultureMondayIntegration
 
                 try
                 {
-                    // Get full audit
+                    // a) Fetch full audit
                     var detResp = await sc.GetAsync($"/audits/{Uri.EscapeDataString(auditId)}");
                     detResp.EnsureSuccessStatusCode();
                     var detJson = await detResp.Content.ReadAsStringAsync();
                     var root = JsonDocument.Parse(detJson).RootElement;
                     var ad = root.GetProperty("audit_data");
 
-                    // Core fields
-                    var createdDate = DateTimeOffset
+                    // b) Core fields
+                    string createdDate = DateTimeOffset
                         .Parse(root.GetProperty("created_at").GetString()!)
                         .ToString("yyyy-MM-dd");
 
-                    var rawScore = ad.GetProperty("score_percentage").GetDouble();
-                    var scorePct = Convert.ToInt32(Math.Round(rawScore));
+                    double rawScore = ad.GetProperty("score_percentage").GetDouble();
+                    int scorePct = Convert.ToInt32(Math.Round(rawScore));
 
-                    var compRaw = ad.TryGetProperty("completed_date", out var cd)
+                    string compRaw = ad.TryGetProperty("completed_date", out var cd)
                         ? cd.GetString()!
                         : ad.TryGetProperty("completed_at", out var ca)
-                          ? ca.GetString()!
-                          : DateTimeOffset.UtcNow.ToString("o");
-                    var completedDate = DateTimeOffset.Parse(compRaw).ToString("yyyy-MM-dd");
+                            ? ca.GetString()!
+                            : DateTimeOffset.UtcNow.ToString("o");
+                    string completedDate = DateTimeOffset.Parse(compRaw).ToString("yyyy-MM-dd");
 
-                    var statusValue = ad.TryGetProperty("completion_status", out var cs)
-                        ? cs.GetString()! : "UNKNOWN";
+                    // c) Normalize completion_status → "complete"/"incomplete"
+                    string rawStatus = ad.TryGetProperty("completion_status", out var cs)
+                        ? cs.GetString()!
+                        : "";
+                    string statusValue = rawStatus.Equals("completed", StringComparison.OrdinalIgnoreCase)
+                        ? "complete"
+                        : "incomplete";
 
-                    // Header items
+                    // d) Header items
                     string partNumber = "";
                     int quantity = 0;
                     string transaction = "";
 
                     if (root.TryGetProperty("header_items", out var headers))
+                    {
                         foreach (var hi in headers.EnumerateArray())
                         {
                             if (!hi.TryGetProperty("label", out var lbl) ||
@@ -131,11 +136,15 @@ namespace SafetyCultureMondayIntegration
                             var label = lbl.GetString()!;
                             if (label.Equals("Part-Number", StringComparison.OrdinalIgnoreCase)
                              && resp.TryGetProperty("text", out var tP))
+                            {
                                 partNumber = tP.GetString()!;
+                            }
                             else if (label.Equals("Quantity", StringComparison.OrdinalIgnoreCase)
                                   && resp.TryGetProperty("text", out var tQ)
                                   && int.TryParse(tQ.GetString(), out var qv))
+                            {
                                 quantity = qv;
+                            }
                             else if (label.StartsWith("Trans", StringComparison.OrdinalIgnoreCase)
                                   && resp.TryGetProperty("selected", out var sel)
                                   && sel.ValueKind == JsonValueKind.Array
@@ -143,30 +152,29 @@ namespace SafetyCultureMondayIntegration
                             {
                                 var choice = sel[0];
                                 transaction = choice.TryGetProperty("label", out var l2)
-                                            ? l2.GetString()!
-                                            : choice.GetProperty("value").GetString()!;
+                                    ? l2.GetString()!
+                                    : choice.GetProperty("value").GetString()!;
                             }
                         }
+                    }
 
-                    // Build column_values
+                    // e) Build column_values
                     var cols = new Dictionary<string, object>
                     {
                         [cfg.Monday.ColumnCreated] = new { date = createdDate },
                         [cfg.Monday.ColumnCompleted] = new { date = completedDate },
-
-                        [cfg.Monday.ColumnStatus] = statusValue,
-                        [cfg.Monday.ColumnPartNumber] = partNumber,
-                        [cfg.Monday.ColumnTransaction] = transaction,
-
-                        [cfg.Monday.ColumnScore] = scorePct,
-                        [cfg.Monday.ColumnQuantity] = quantity
+                        [cfg.Monday.ColumnScore] = scorePct,      // NUMBERS
+                        [cfg.Monday.ColumnQuantity] = quantity,      // NUMBERS
+                        [cfg.Monday.ColumnPartNumber] = partNumber,    // TEXT
+                        [cfg.Monday.ColumnTransaction] = transaction    // TEXT
                     };
 
-                    Console.WriteLine(">>> column_values:\n"
-                        + JsonSerializer.Serialize(cols, new JsonSerializerOptions { WriteIndented = true }));
+                    Console.WriteLine(">>> column_values:\n" +
+                        JsonSerializer.Serialize(cols, new JsonSerializerOptions { WriteIndented = true }));
 
-                    // Try to find existing item by `name`
-                    var existing = await TryFindItem(mc, cfg.Monday.BoardId, cfg.Monday.ColumnName, itemName);
+                    // f) Upsert by name
+                    var existing = await TryFindItem(mc, cfg.Monday.BoardId,
+                                                     cfg.Monday.ColumnName, itemName);
                     if (existing != null)
                     {
                         Console.WriteLine($"> Updating item #{existing}");
@@ -180,9 +188,8 @@ namespace SafetyCultureMondayIntegration
                 }
                 catch (Exception ex)
                 {
-                    Console.WriteLine($"!!! ERROR for {auditId}: {ex}");
+                    Console.WriteLine($"!!! ERROR for {auditId}: {ex.Message}");
                 }
-
                 Console.WriteLine();
             }
 
@@ -197,9 +204,7 @@ query($boardId:ID!,$columnId:String!,$columnValue:String!){
     board_id:$boardId,
     columns:[{column_id:$columnId,column_values:[$columnValue]}],
     limit:1
-  ){
-    items { id }
-  }
+  ){ items { id } }
 }";
             var payload = JsonSerializer.Serialize(new
             {
@@ -207,7 +212,8 @@ query($boardId:ID!,$columnId:String!,$columnValue:String!){
                 variables = new { boardId, columnId, columnValue }
             });
 
-            var resp = await client.PostAsync("", new StringContent(payload, Encoding.UTF8, "application/json"));
+            var resp = await client.PostAsync("",
+                new StringContent(payload, Encoding.UTF8, "application/json"));
             var body = await resp.Content.ReadAsStringAsync();
             Console.WriteLine(">>> FIND response:\n" + body);
 
@@ -225,7 +231,6 @@ query($boardId:ID!,$columnId:String!,$columnValue:String!){
 
             if (items.ValueKind == JsonValueKind.Array && items.GetArrayLength() > 0)
                 return items[0].GetProperty("id").GetString();
-
             return null;
         }
 
@@ -242,7 +247,8 @@ mutation($b:ID!,$n:String!,$c:JSON!){
                 variables = new { b = boardId, n = itemName, c = colJson }
             });
 
-            var resp = await client.PostAsync("", new StringContent(payload, Encoding.UTF8, "application/json"));
+            var resp = await client.PostAsync("",
+                new StringContent(payload, Encoding.UTF8, "application/json"));
             var body = await resp.Content.ReadAsStringAsync();
             Console.WriteLine(">>> CREATE response:\n" + body);
 
@@ -250,10 +256,11 @@ mutation($b:ID!,$n:String!,$c:JSON!){
             if (doc.RootElement.TryGetProperty("errors", out var errs))
                 throw new Exception("GraphQL errors on create:\n" + errs);
 
-            var id = doc.RootElement.GetProperty("data")
-                                    .GetProperty("create_item")
-                                    .GetProperty("id")
-                                    .GetString();
+            var id = doc.RootElement
+                        .GetProperty("data")
+                        .GetProperty("create_item")
+                        .GetProperty("id")
+                        .GetString();
             Console.WriteLine($"> Created item #{id}");
         }
 
@@ -270,7 +277,8 @@ mutation($i:ID!,$b:ID!,$c:JSON!){
                 variables = new { i = itemId, b = boardId, c = colJson }
             });
 
-            var resp = await client.PostAsync("", new StringContent(payload, Encoding.UTF8, "application/json"));
+            var resp = await client.PostAsync("",
+                new StringContent(payload, Encoding.UTF8, "application/json"));
             var body = await resp.Content.ReadAsStringAsync();
             Console.WriteLine(">>> CHANGE response:\n" + body);
 
@@ -278,10 +286,11 @@ mutation($i:ID!,$b:ID!,$c:JSON!){
             if (doc.RootElement.TryGetProperty("errors", out var errs))
                 throw new Exception("GraphQL errors on update:\n" + errs);
 
-            var id = doc.RootElement.GetProperty("data")
-                                    .GetProperty("change_multiple_column_values")
-                                    .GetProperty("id")
-                                    .GetString();
+            var id = doc.RootElement
+                        .GetProperty("data")
+                        .GetProperty("change_multiple_column_values")
+                        .GetProperty("id")
+                        .GetString();
             Console.WriteLine($"> Updated item #{id}");
         }
     }
